@@ -1,6 +1,3 @@
-Aşağıdaki README’yi güncelledim. StorCLI linki senin verdiğin GitHub raw link olarak eklendi ve kurulum kısmı belirtildi. Script zaten `.sh` dosyasında otomatik StorCLI kurulumunu destekliyor. 
-
-````markdown
 # Detect Hardware
 
 A lightweight server inventory and hardware detection script for Linux dedicated servers.
@@ -116,7 +113,7 @@ The script works on Linux systems and should be run as root for full hardware de
 
 Recommended packages:
 
-```bash
+``` bash
 apt update
 apt install -y dmidecode smartmontools pciutils iproute2 util-linux ipmitool curl wget
 ```
