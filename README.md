@@ -352,5 +352,4 @@ Example:
     IPv4: 192.0.2.10/29
 
 ## License
-
 MIT License
