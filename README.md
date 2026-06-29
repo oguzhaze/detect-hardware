@@ -1,23 +1,30 @@
+Aşağıdaki README’yi güncelledim. StorCLI linki senin verdiğin GitHub raw link olarak eklendi ve kurulum kısmı belirtildi. Script zaten `.sh` dosyasında otomatik StorCLI kurulumunu destekliyor. 
+
+````markdown
 # Detect Hardware
 
-A lightweight hardware detection and server inventory tool for Linux dedicated servers.
+A lightweight server inventory and hardware detection script for Linux dedicated servers.
 
-`detect-hardware` collects and reports detailed hardware, firmware, storage, RAID, network, and health information from Linux servers in a clean inventory format.
+`Detect Hardware` prints a clean hardware inventory report including system information, BIOS/firmware, CPU, memory, RAID status, disk health, network configuration and power supply information.
+
+It is designed for bare-metal Linux servers, dedicated servers, rescue environments and provisioning systems.
 
 ## Features
 
 - System manufacturer, model, serial number and UUID detection
 - Operating system and kernel information
-- Motherboard / baseboard details
-- BIOS and firmware information
-- CPU model, socket, core and thread count
+- Package update status
+- Motherboard / baseboard information
+- BIOS version, release date and firmware mode
+- Chassis serial and asset tag information
+- CPU model, socket count, cores and threads
 - RAM capacity, DIMM slot usage and memory module details
-- Hardware RAID controller detection
+- Hardware RAID and software RAID detection
 - RAID level and RAID state reporting
-- Disk and physical drive inventory
-- SMART / disk health information
-- Network IP, gateway and DNS detection
-- Power supply status detection on supported servers
+- Physical disk detection behind MegaRAID controllers
+- SMART disk health, temperature, wear and power-on information
+- IPv4 address, gateway and DNS detection
+- Power supply information from SMBIOS and IPMI where available
 - Clean and readable CLI output
 
 ## Example Output
@@ -105,88 +112,222 @@ A lightweight hardware detection and server inventory tool for Linux dedicated s
 
 ## Requirements
 
-The script may require the following Linux tools depending on the hardware:
+The script works on Linux systems and should be run as root for full hardware details.
 
-```bash
-dmidecode
-lshw
-lscpu
-lsblk
-smartctl
-storcli / perccli / megacli
-iproute2
-```
-
-On Ubuntu/Debian:
+Recommended packages:
 
 ```bash
 apt update
-apt install -y dmidecode lshw smartmontools pciutils iproute2
+apt install -y dmidecode smartmontools pciutils iproute2 util-linux ipmitool curl wget
 ```
 
-For Broadcom / LSI MegaRAID controllers, install `storcli` or a compatible RAID management utility.
+Main tools used:
 
-## Usage
+```text
+dmidecode
+smartctl
+lsblk
+lscpu
+lspci
+ip
+resolvectl
+ipmitool
+storcli / storcli2 / perccli / megacli
+```
+
+## Installation
 
 Clone the repository:
 
 ```bash
-git clone https://github.com/USERNAME/detect-hardware.git
+git clone https://github.com/oguzhaze/detect-hardware.git
 cd detect-hardware
 ```
 
 Make the script executable:
 
 ```bash
-chmod +x detect-hardware.sh
+chmod +x inventory.sh
 ```
 
-Run as root:
+Run the script:
 
 ```bash
-sudo ./detect-hardware.sh
+sudo ./inventory.sh
 ```
 
-Root privileges are recommended because some hardware, DMI, RAID and SMART information may not be available to normal users.
+## StorCLI Installation
 
-## Supported Hardware
+For Broadcom / LSI MegaRAID controllers, the script uses StorCLI to read RAID level, virtual drive state and physical disk details.
 
-This tool is designed mainly for Linux dedicated servers and bare-metal environments.
+The default StorCLI package used by this project is:
 
-Tested or intended use cases include:
+```text
+https://github.com/oguzhaze/detect-hardware/raw/refs/heads/main/storcli_007.3703.0000.0000_all.deb
+```
+
+If a hardware RAID controller is detected and no compatible RAID CLI is found, the script can automatically download and install StorCLI on `.deb` / `dpkg` based systems.
+
+Automatic installation is done when you run:
+
+```bash
+sudo ./inventory.sh
+```
+
+To disable automatic StorCLI installation:
+
+```bash
+NO_INSTALL=1 sudo ./inventory.sh
+```
+
+Manual StorCLI installation:
+
+```bash
+wget -O /tmp/storcli.deb "https://github.com/oguzhaze/detect-hardware/raw/refs/heads/main/storcli_007.3703.0000.0000_all.deb"
+sudo dpkg -i /tmp/storcli.deb || sudo apt-get -f install -y
+```
+
+After installation, run the inventory script again:
+
+```bash
+sudo ./inventory.sh
+```
+
+You can also override the StorCLI package URL:
+
+```bash
+STORCLI_DEB_URL="https://github.com/oguzhaze/detect-hardware/raw/refs/heads/main/storcli_007.3703.0000.0000_all.deb" sudo ./inventory.sh
+```
+
+## Usage
+
+Basic usage:
+
+```bash
+sudo ./inventory.sh
+```
+
+Run without automatic StorCLI installation:
+
+```bash
+NO_INSTALL=1 sudo ./inventory.sh
+```
+
+Save output to a file:
+
+```bash
+sudo ./inventory.sh > server-inventory.txt
+```
+
+## RAID Support
+
+The script can detect both software RAID and hardware RAID.
+
+Supported RAID detection methods include:
+
+- Linux software RAID using `mdadm` / `/proc/mdstat`
+- Broadcom / LSI MegaRAID controllers
+- StorCLI / StorCLI2
+- PercCLI
+- MegaCLI
+- SMART passthrough for physical disks behind MegaRAID controllers
+
+If a hardware RAID controller is detected and no RAID CLI is found, the script can automatically install Broadcom StorCLI on `.deb` / `dpkg` based systems.
+
+To disable automatic installation:
+
+```bash
+NO_INSTALL=1 sudo ./inventory.sh
+```
+
+## SMART / Disk Health
+
+Disk health information is collected with `smartctl`.
+
+Depending on the disk and controller type, the script may show:
+
+- SMART health status
+- Disk temperature
+- SSD wear percentage
+- Power-on hours
+- Available spare
+- Reallocated sectors or grown defects
+- Physical disks behind RAID controller
+
+Root access is required for complete SMART details.
+
+## Power Supply Information
+
+Power supply data may be collected from:
+
+- SMBIOS / DMI Type 39
+- IPMI sensors through `ipmitool`
+- IPMI DCMI power readings
+
+Power supply information depends on server model, BIOS/BMC support and installed tools.
+
+## Supported Use Cases
+
+This project is useful for:
+
+- Dedicated server inventory
+- Bare-metal provisioning
+- Rescue system checks
+- Datacenter hardware verification
+- RAID status checks
+- Disk health reporting
+- Server delivery validation
+- Support ticket diagnostics
+- Asset documentation
+
+## Tested / Intended Hardware
+
+The script is mainly intended for Linux dedicated servers such as:
 
 - Supermicro servers
-- AMD Ryzen / EPYC based dedicated servers
-- Hardware RAID servers
-- Broadcom / LSI MegaRAID controllers
-- NVMe and SATA/SAS disks
-- Linux rescue environments
-- Provisioning and inventory systems
+- AMD Ryzen dedicated servers
+- AMD EPYC servers
+- Hardware RAID based servers
+- Broadcom / LSI MegaRAID systems
+- NVMe, SATA and SAS disk systems
 
 ## Notes
 
-Some values depend on server hardware, BIOS support and installed vendor tools.
+Some information may not be available on all systems.
 
 For example:
 
-- RAID details may require `storcli`, `perccli` or `megacli`
-- Disk health may require `smartctl`
-- PSU status may depend on IPMI/DMI support
-- Some serial numbers may be hidden or unavailable depending on the system
+- Serial numbers may require root access
+- DMI information requires `dmidecode`
+- SMART health requires `smartmontools`
+- Hardware RAID details may require `storcli`, `perccli` or `megacli`
+- PSU health may require `ipmitool` and BMC/IPMI support
+- Some virtual machines may not expose real hardware details
 
 ## Security Notice
 
-The output may contain sensitive information such as:
+The output may contain sensitive server information.
+
+Before sharing the output publicly, remove or mask:
 
 - Server serial number
 - UUID
+- Chassis serial number
 - Disk serial numbers
-- IP address
+- Memory serial numbers
+- Public IP address
 - Gateway
 - DNS configuration
 
-Do not share raw output publicly unless sensitive values are removed.
+Example:
+
+```text
+Serial Number: XXXXXXXX
+UUID: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+IPv4: 192.0.2.10/29
+```
 
 ## License
 
 MIT License
+````
