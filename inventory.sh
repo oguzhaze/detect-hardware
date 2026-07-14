@@ -36,6 +36,32 @@ STORCLI_DEB_URL="${STORCLI_DEB_URL:-https://github.com/oguzhaze/detect-hardware/
 # SHA-256 checksum for the .deb above. Defaults to "<deb URL>.sha256"; override if hosted elsewhere.
 STORCLI_SHA256_URL="${STORCLI_SHA256_URL:-${STORCLI_DEB_URL}.sha256}"
 
+# --- Optional GPG signature verification (stronger than SHA-256: proves authenticity) ---
+# Set STORCLI_GPG_FPR to the signer's 40-hex fingerprint to ENABLE the GPG gate. When set,
+# GPG becomes authoritative and the .deb is installed only if its detached signature is
+# valid AND made by this exact key. When empty, the script falls back to the SHA-256 gate.
+STORCLI_GPG_FPR="${STORCLI_GPG_FPR:-17DE0DD5087736DE1F2F9D5709E6044E2D5B8633}"
+STORCLI_SIG_URL="${STORCLI_SIG_URL:-${STORCLI_DEB_URL}.asc}"   # detached armored signature (.asc)
+STORCLI_GPG_KEY_URL="${STORCLI_GPG_KEY_URL:-}"                 # public key URL (if not embedded below)
+# Recommended: pin the ASCII-armored public key directly in the script (can't be swapped
+# by whoever hosts the files). Fill it in and it takes precedence over STORCLI_GPG_KEY_URL:
+#   STORCLI_GPG_PUBKEY='-----BEGIN PGP PUBLIC KEY BLOCK-----
+#   ... your exported public key ...
+#   -----END PGP PUBLIC KEY BLOCK-----'
+STORCLI_GPG_PUBKEY="${STORCLI_GPG_PUBKEY:-$(cat <<'PUBKEY'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEalY+LhYJKwYBBAHaRw8BAQdAJw56VTY0ZigNkqAi/a5Nv285iERc3fCS6kWE
+cMwLr1e0K3NlcnZlci5uZXQgU3RvckNMSSBTaWduaW5nIDxvcHNAc2VydmVyLm5l
+dD6ImQQTFgoAQRYhBBfeDdUIdzbeHy+dVwnmBE4tW4YzBQJqVj4uAhsDBQkDwmcA
+BQsJCAcCAiICBhUKCQgLAgQWAgMBAh4HAheAAAoJEAnmBE4tW4Yz2XMBAM5DA0Ag
+5MesEBKwdRUcj6HYgOJcJZg3kbTjR80aaIlhAP9AOR/bnujwJWkU6zRYG/7RCFDT
+Q/2dmy4sQaWC1Fe4Ag==
+=GoVH
+-----END PGP PUBLIC KEY BLOCK-----
+PUBKEY
+)}"
+
 # Lightweight network info (no ping/curl) for the inventory
 gather_net_info() {
   local ipv4_cidr gw4 dns_list
@@ -314,6 +340,51 @@ verify_sha256() {
   [[ "$want" == "$got" ]]
 }
 
+# Make sure gpg is available; try to install gnupg on dpkg/apt systems. 0 if usable.
+ensure_gpg() {
+  command -v gpg >/dev/null 2>&1 && return 0
+  command -v apt-get >/dev/null 2>&1 || return 1
+  echo "Installing gnupg for signature verification..."
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y gnupg >/dev/null 2>&1
+  command -v gpg >/dev/null 2>&1
+}
+
+# Verify <file> against detached signature <sig>, requiring a VALID signature from the
+# pinned key (STORCLI_GPG_FPR). Public key comes from STORCLI_GPG_PUBKEY (embedded) or
+# STORCLI_GPG_KEY_URL. Uses an ephemeral keyring so the host GPG state is never touched.
+#   0 = valid signature from the expected key | 1 = BAD/wrong signer | 3 = gpg missing
+#   4 = no pinned key/fingerprint configured
+verify_gpg() {
+  local file="$1" sig="$2" fpr="${STORCLI_GPG_FPR//[[:space:]]/}"
+  command -v gpg >/dev/null 2>&1 || return 3
+  [[ -n "$fpr" ]] || return 4
+  [[ -s "$file" && -s "$sig" ]] || return 1
+
+  local gh status rc=1 kf
+  gh="$(mktemp -d /tmp/storcli-gpg.XXXXXX)" || return 1
+  chmod 700 "$gh"
+
+  # Load the pinned public key: embedded block preferred, else fetch from URL.
+  if [[ -n "${STORCLI_GPG_PUBKEY:-}" ]]; then
+    printf '%s\n' "$STORCLI_GPG_PUBKEY" | gpg --homedir "$gh" --batch --quiet --import 2>/dev/null
+  elif [[ -n "${STORCLI_GPG_KEY_URL:-}" ]]; then
+    kf="$gh/pub.key"
+    if ! _dl "$STORCLI_GPG_KEY_URL" "$kf"; then rm -rf "$gh"; return 4; fi
+    gpg --homedir "$gh" --batch --quiet --import "$kf" 2>/dev/null
+  else
+    rm -rf "$gh"; return 4
+  fi
+
+  # Require VALIDSIG whose (sub or primary) fingerprint equals the pinned one.
+  status="$(gpg --homedir "$gh" --batch --status-fd 1 --verify "$sig" "$file" 2>/dev/null)"
+  if printf '%s\n' "$status" | grep -iE '^\[GNUPG:\] VALIDSIG ' | grep -qi "$fpr"; then
+    rc=0
+  fi
+  rm -rf "$gh"
+  return $rc
+}
+
 install_storcli() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
   [[ "$IS_ROOT" -eq 1 ]] || return
@@ -329,6 +400,7 @@ install_storcli() {
 
   local deb="/tmp/storcli_install.$$.deb"
   local sum="/tmp/storcli_install.$$.deb.sha256"
+  local sig="/tmp/storcli_install.$$.deb.asc"
   local rc
 
   echo "RAID CLI not found - downloading Broadcom StorCLI..."
@@ -336,30 +408,60 @@ install_storcli() {
     echo "StorCLI download failed (check network/URL)."; rm -f "$deb"; return
   fi
 
-  # --- Integrity gate: verify the .deb against its published SHA-256 BEFORE installing. ---
-  # If the checksum can't be fetched or doesn't match, we abort and never touch dpkg.
-  echo "Verifying StorCLI package checksum (SHA-256)..."
-  if ! _dl "$STORCLI_SHA256_URL" "$sum"; then
-    echo "Checksum file could not be downloaded: $STORCLI_SHA256_URL"
-    echo "Aborting - StorCLI NOT installed (unverified package removed)."
-    add_warn "StorCLI checksum unavailable - install skipped"
-    rm -f "$deb" "$sum"; return
+  # --- Verification gate (fail-closed): nothing is installed unless the package passes. ---
+  if [[ -n "${STORCLI_GPG_FPR//[[:space:]]/}" ]]; then
+    # Strong path: GPG signature proves the package is authentic (signed by our pinned key).
+    echo "Verifying StorCLI package GPG signature..."
+    if ! ensure_gpg; then
+      echo "gpg unavailable and could not be installed - cannot verify signature."
+      echo "Aborting - StorCLI NOT installed (unverified package removed)."
+      add_warn "StorCLI GPG verify impossible (no gpg) - install skipped"
+      rm -f "$deb"; return
+    fi
+    if ! _dl "$STORCLI_SIG_URL" "$sig"; then
+      echo "Signature could not be downloaded: $STORCLI_SIG_URL"
+      echo "Aborting - StorCLI NOT installed (unverified package removed)."
+      add_warn "StorCLI signature unavailable - install skipped"
+      rm -f "$deb" "$sig"; return
+    fi
+    verify_gpg "$deb" "$sig"; rc=$?
+    rm -f "$sig"
+    if [[ "$rc" -ne 0 ]]; then
+      case "$rc" in
+        1) echo "BAD SIGNATURE or wrong signer - package is NOT authentic." ;;
+        3) echo "gpg not available - cannot verify signature." ;;
+        4) echo "No pinned public key/fingerprint configured (set STORCLI_GPG_PUBKEY or STORCLI_GPG_KEY_URL)." ;;
+        *) echo "Signature verification error (code $rc)." ;;
+      esac
+      echo "Aborting - StorCLI NOT installed (unverified package removed)."
+      add_warn "StorCLI GPG verification failed - install skipped"
+      rm -f "$deb"; return
+    fi
+    echo "GPG signature OK - package authenticated by pinned key; proceeding with install."
+  else
+    # Fallback path: SHA-256 checksum (integrity only). Aborts on any mismatch / failure.
+    echo "Verifying StorCLI package checksum (SHA-256)..."
+    if ! _dl "$STORCLI_SHA256_URL" "$sum"; then
+      echo "Checksum file could not be downloaded: $STORCLI_SHA256_URL"
+      echo "Aborting - StorCLI NOT installed (unverified package removed)."
+      add_warn "StorCLI checksum unavailable - install skipped"
+      rm -f "$deb" "$sum"; return
+    fi
+    verify_sha256 "$deb" "$sum"; rc=$?
+    rm -f "$sum"
+    if [[ "$rc" -ne 0 ]]; then
+      case "$rc" in
+        1) echo "CHECKSUM MISMATCH - package is corrupt or has been tampered with." ;;
+        3) echo "No SHA-256 tool (sha256sum/shasum/openssl) found - cannot verify." ;;
+        4) echo "Checksum file has no valid SHA-256 value." ;;
+        *) echo "Checksum verification error (code $rc)." ;;
+      esac
+      echo "Aborting - StorCLI NOT installed (unverified package removed)."
+      add_warn "StorCLI checksum verification failed - install skipped"
+      rm -f "$deb"; return
+    fi
+    echo "Checksum OK - package verified; proceeding with install."
   fi
-
-  verify_sha256 "$deb" "$sum"; rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    case "$rc" in
-      1) echo "CHECKSUM MISMATCH - package is corrupt or has been tampered with." ;;
-      3) echo "No SHA-256 tool (sha256sum/shasum/openssl) found - cannot verify." ;;
-      4) echo "Checksum file has no valid SHA-256 value." ;;
-      *) echo "Checksum verification error (code $rc)." ;;
-    esac
-    echo "Aborting - StorCLI NOT installed (unverified package removed)."
-    add_warn "StorCLI checksum verification failed - install skipped"
-    rm -f "$deb" "$sum"; return
-  fi
-  echo "Checksum OK - package verified; proceeding with install."
-  rm -f "$sum"
 
   if dpkg -i "$deb" >/dev/null 2>&1; then
     echo "StorCLI installed: $(find_raid_tool 2>/dev/null || echo /opt/MegaRAID/storcli/storcli64)"
