@@ -27,10 +27,14 @@ WARNINGS=(); add_warn(){ WARNINGS+=("$1"); }
 STATUS_SMART="SKIP"; SUM_SMART=""
 STATUS_RAID="SKIP";  SUM_RAID=""
 RAID_KIND=""; RAID_LEVEL=""; RAID_CTRL=""
+# Hardware RAID controller version/firmware (populated by raid_controller_version)
+RAID_CTRL_MODEL=""; RAID_CTRL_FW=""; RAID_CTRL_PKG=""; RAID_CTRL_BIOS=""; RAID_CTRL_DRV=""; RAID_CTRL_SN=""
 NET_IPV4=""; NET_GW=""; NET_DNS=""
 OS_UPDATES=""; Q_OS=""
 
 STORCLI_DEB_URL="${STORCLI_DEB_URL:-https://github.com/oguzhaze/detect-hardware/raw/refs/heads/main/storcli_007.3703.0000.0000_all.deb}"
+# SHA-256 checksum for the .deb above. Defaults to "<deb URL>.sha256"; override if hosted elsewhere.
+STORCLI_SHA256_URL="${STORCLI_SHA256_URL:-${STORCLI_DEB_URL}.sha256}"
 
 # Lightweight network info (no ping/curl) for the inventory
 gather_net_info() {
@@ -280,6 +284,36 @@ infer_raid_level() {
     }'
 }
 
+# Download <url> to <dest> using curl or wget. Returns 0 only if a non-empty file results.
+_dl() {
+  local url="$1" dest="$2"
+  if   command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 60 -o "$dest" "$url" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then wget -q --timeout=60 -O "$dest" "$url" 2>/dev/null
+  else return 2; fi
+  [[ -s "$dest" ]]
+}
+
+# Verify <file> against a .sha256 file <src> (accepts "hash  name" or a bare hash).
+#   0 = match | 1 = MISMATCH | 2 = missing file | 3 = no hashing tool | 4 = no hash in src
+verify_sha256() {
+  local file="$1" src="$2" want got tool
+  [[ -s "$file" ]] || return 2
+  if   command -v sha256sum >/dev/null 2>&1; then tool="sha256sum"
+  elif command -v shasum    >/dev/null 2>&1; then tool="shasum"
+  elif command -v openssl   >/dev/null 2>&1; then tool="openssl"
+  else return 3; fi
+  want="$(grep -oiE '[0-9a-f]{64}' "$src" 2>/dev/null | head -1 | tr 'A-F' 'a-f')"
+  [[ -n "$want" ]] || return 4
+  case "$tool" in
+    sha256sum) got="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')" ;;
+    shasum)    got="$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}')" ;;
+    openssl)   got="$(openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}')" ;;
+  esac
+  got="$(printf '%s' "$got" | tr 'A-F' 'a-f')"
+  [[ -n "$got" ]] || return 5
+  [[ "$want" == "$got" ]]
+}
+
 install_storcli() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
   [[ "$IS_ROOT" -eq 1 ]] || return
@@ -294,18 +328,39 @@ install_storcli() {
   fi
 
   local deb="/tmp/storcli_install.$$.deb"
-  echo "RAID CLI not found - downloading Broadcom StorCLI..."
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 60 -o "$deb" "$STORCLI_DEB_URL" 2>/dev/null
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=60 -O "$deb" "$STORCLI_DEB_URL" 2>/dev/null
-  else
-    echo "Neither curl nor wget available; cannot fetch StorCLI."; return
-  fi
+  local sum="/tmp/storcli_install.$$.deb.sha256"
+  local rc
 
-  if [[ ! -s "$deb" ]]; then
+  echo "RAID CLI not found - downloading Broadcom StorCLI..."
+  if ! _dl "$STORCLI_DEB_URL" "$deb"; then
     echo "StorCLI download failed (check network/URL)."; rm -f "$deb"; return
   fi
+
+  # --- Integrity gate: verify the .deb against its published SHA-256 BEFORE installing. ---
+  # If the checksum can't be fetched or doesn't match, we abort and never touch dpkg.
+  echo "Verifying StorCLI package checksum (SHA-256)..."
+  if ! _dl "$STORCLI_SHA256_URL" "$sum"; then
+    echo "Checksum file could not be downloaded: $STORCLI_SHA256_URL"
+    echo "Aborting - StorCLI NOT installed (unverified package removed)."
+    add_warn "StorCLI checksum unavailable - install skipped"
+    rm -f "$deb" "$sum"; return
+  fi
+
+  verify_sha256 "$deb" "$sum"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    case "$rc" in
+      1) echo "CHECKSUM MISMATCH - package is corrupt or has been tampered with." ;;
+      3) echo "No SHA-256 tool (sha256sum/shasum/openssl) found - cannot verify." ;;
+      4) echo "Checksum file has no valid SHA-256 value." ;;
+      *) echo "Checksum verification error (code $rc)." ;;
+    esac
+    echo "Aborting - StorCLI NOT installed (unverified package removed)."
+    add_warn "StorCLI checksum verification failed - install skipped"
+    rm -f "$deb" "$sum"; return
+  fi
+  echo "Checksum OK - package verified; proceeding with install."
+  rm -f "$sum"
+
   if dpkg -i "$deb" >/dev/null 2>&1; then
     echo "StorCLI installed: $(find_raid_tool 2>/dev/null || echo /opt/MegaRAID/storcli/storcli64)"
   else
@@ -317,6 +372,40 @@ install_storcli() {
     fi
   fi
   rm -f "$deb"
+}
+
+# Read the hardware RAID controller's own version info (model / firmware / BIOS /
+# driver / serial). Handles storcli, storcli2 and megacli label variants.
+raid_controller_version() {
+  local tool="$1" out
+  [[ -n "$tool" ]] || return 1
+
+  case "$tool" in
+    *megacli*|*MegaCli*)
+      out="$("$tool" -AdpAllInfo -aAll -NoLog 2>/dev/null)"
+      [[ -z "$out" ]] && return 1
+      RAID_CTRL_MODEL="$(printf '%s\n' "$out" | sed -nE 's/.*Product Name[[:space:]]*:[[:space:]]*(.+)/\1/Ip'       | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_FW="$(printf '%s\n' "$out"    | sed -nE 's/.*FW Version[[:space:]]*:[[:space:]]*(.+)/\1/Ip'         | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_PKG="$(printf '%s\n' "$out"   | sed -nE 's/.*FW Package Build[[:space:]]*:[[:space:]]*(.+)/\1/Ip'   | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_BIOS="$(printf '%s\n' "$out"  | sed -nE 's/.*BIOS Version[[:space:]]*:[[:space:]]*(.+)/\1/Ip'       | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_SN="$(printf '%s\n' "$out"    | sed -nE 's/.*Serial No[[:space:]]*:[[:space:]]*(.+)/\1/Ip'          | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      ;;
+    *)
+      # storcli / storcli2 / perccli - try c0 first, then any controller
+      out="$("$tool" /c0 show all nolog 2>/dev/null)"
+      [[ -z "$out" ]] && out="$("$tool" /c0 show all 2>/dev/null)"
+      [[ -z "$out" ]] && out="$("$tool" /call show all nolog 2>/dev/null)"
+      [[ -z "$out" ]] && return 1
+      # Version section uses "Key = Value"; PD list is tabular, so key=value stays controller-scoped.
+      RAID_CTRL_MODEL="$(printf '%s\n' "$out" | sed -nE 's/.*(Product Name|Model)[[:space:]]*=[[:space:]]*(.+)/\2/Ip'                 | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_FW="$(printf '%s\n' "$out"    | sed -nE 's/.*(FW Version|Firmware Version)[[:space:]]*=[[:space:]]*(.+)/\2/Ip'         | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_PKG="$(printf '%s\n' "$out"   | sed -nE 's/.*(FW Package Build|Firmware Package Build)[[:space:]]*=[[:space:]]*(.+)/\2/Ip' | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_BIOS="$(printf '%s\n' "$out"  | sed -nE 's/.*(BIOS Version|Bios Version)[[:space:]]*=[[:space:]]*(.+)/\2/Ip'           | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_DRV="$(printf '%s\n' "$out"   | sed -nE 's/.*Driver Version[[:space:]]*=[[:space:]]*(.+)/\1/Ip'                        | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      RAID_CTRL_SN="$(printf '%s\n' "$out"    | sed -nE 's/.*Serial Number[[:space:]]*=[[:space:]]*(.+)/\1/Ip'                         | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+      ;;
+  esac
+  return 0
 }
 
 check_raid() {
@@ -366,6 +455,7 @@ check_raid() {
     raidtool="$(find_raid_tool)"
     if [[ -n "$raidtool" ]]; then
       echo "Using RAID CLI: $raidtool"
+      raid_controller_version "$raidtool"    # model / FW / BIOS / driver version
       # storcli vs storcli2 accept slightly different scopes - try a few
       for spec in "/call/vall show nolog" "/c0/vall show nolog" "/call/vall show" "/c0/vall show"; do
         read -r -a try <<< "$spec"
@@ -375,6 +465,7 @@ check_raid() {
       done
     elif command -v megacli >/dev/null 2>&1 || command -v MegaCli64 >/dev/null 2>&1; then
       raidtool="$(command -v megacli || command -v MegaCli64)"
+      raid_controller_version "$raidtool"    # model / FW / BIOS version
       vdout="$("$raidtool" -LDInfo -Lall -aAll -NoLog 2>/dev/null)"
     fi
 
@@ -452,7 +543,7 @@ dmi_field() {
 }
 
 inventory_disks() {
-  local raid=0 base="" n out model sn size tran name serial phys=0
+  local raid=0 base="" n out model sn size tran name serial phys=0 rev fw
 
   command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi 'raid' && raid=1
 
@@ -466,10 +557,11 @@ inventory_disks() {
       size="$(sed -nE 's/.*(^| )SIZE="([^"]*)".*/\2/p'     <<<"$line")"
       serial="$(sed -nE 's/.*(^| )SERIAL="([^"]*)".*/\2/p' <<<"$line")"
       tran="$(sed -nE 's/.*(^| )TRAN="([^"]*)".*/\2/p'     <<<"$line")"
+      rev="$(sed -nE 's/.*(^| )REV="([^"]*)".*/\2/p'       <<<"$line")"
       [[ -z "$name" ]] && continue
-      printf '    %-10s %-26s %-9s %-6s SN: %s\n' \
-        "/dev/$name" "${model:-n/a}" "${size:-n/a}" "${tran:-?}" "${serial:-n/a}"
-    done < <(lsblk -dno NAME,MODEL,SIZE,SERIAL,TRAN -P 2>/dev/null)
+      printf '    %-10s %-26s %-9s %-6s FW: %-10s SN: %s\n' \
+        "/dev/$name" "${model:-n/a}" "${size:-n/a}" "${tran:-?}" "${rev:-n/a}" "${serial:-n/a}"
+    done < <(lsblk -dno NAME,MODEL,SIZE,SERIAL,TRAN,REV -P 2>/dev/null)
   fi
 
   # Physical member disks behind a hardware RAID controller (needs smartctl + root)
@@ -487,9 +579,12 @@ inventory_disks() {
         echo "$out"   | grep -qiE 'Enclosure (Services|Device)|SCSI Enclosure' && continue
         sn="$(echo "$out" | sed -nE 's/^Serial [Nn]umber:[[:space:]]+(.+)/\1/p' | head -1 | sed 's/[[:space:]]*$//')"
         size="$(echo "$out" | sed -nE 's/.*\[([0-9.]+ [KMGT]B)\].*/\1/p' | head -1)"
+        # Firmware: ATA/NVMe report "Firmware Version:", SAS/SCSI report "Revision:"
+        fw="$(echo "$out" | sed -nE 's/^Firmware Version:[[:space:]]+(.+)/\1/p' | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+        [[ -z "$fw" ]] && fw="$(echo "$out" | sed -nE 's/^Revision:[[:space:]]+(.+)/\1/p' | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
         phys=$((phys+1))
-        printf '    %-10s %-26s %-9s %-6s SN: %s\n' \
-          "slot $n" "${model:-n/a}" "${size:-n/a}" "raid" "${sn:-n/a}"
+        printf '    %-10s %-26s %-9s %-6s FW: %-10s SN: %s\n' \
+          "slot $n" "${model:-n/a}" "${size:-n/a}" "raid" "${fw:-n/a}" "${sn:-n/a}"
       done
       echo "    Physical disks detected: ${phys}"
     fi
@@ -681,6 +776,12 @@ print_inventory() {
   printf '  %-16s %s\n' 'RAID type:'  "${RAID_KIND:-None}"
   if [[ -n "$RAID_CTRL" && "$RAID_KIND" == "Hardware RAID" ]]; then
     printf '  %-16s %s\n' 'Controller:' "$RAID_CTRL"
+    [[ -n "$RAID_CTRL_MODEL" ]] && printf '  %-16s %s\n' 'Ctrl model:'    "$RAID_CTRL_MODEL"
+    [[ -n "$RAID_CTRL_FW"    ]] && printf '  %-16s %s\n' 'Ctrl FW:'       "$RAID_CTRL_FW"
+    [[ -n "$RAID_CTRL_PKG"   ]] && printf '  %-16s %s\n' 'Ctrl FW pkg:'   "$RAID_CTRL_PKG"
+    [[ -n "$RAID_CTRL_BIOS"  ]] && printf '  %-16s %s\n' 'Ctrl BIOS:'     "$RAID_CTRL_BIOS"
+    [[ -n "$RAID_CTRL_DRV"   ]] && printf '  %-16s %s\n' 'Ctrl driver:'   "$RAID_CTRL_DRV"
+    [[ -n "$RAID_CTRL_SN"    ]] && printf '  %-16s %s\n' 'Ctrl serial:'   "$RAID_CTRL_SN"
   fi
   printf '  %-16s %s\n' 'RAID level:' "${RAID_LEVEL:-n/a}"
   printf '  %-16s %s\n' 'RAID state:' "$(
